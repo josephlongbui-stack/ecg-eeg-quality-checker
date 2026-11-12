@@ -1,0 +1,14 @@
+# Pinned-compatible ranges (versions checked on PyPI 2026-11-12).
+# Used by Streamlit Community Cloud and CI. "-e ." installs our own package.
+numpy>=2.5,<3
+scipy>=1.18,<2
+pandas>=3.1,<4
+mne>=1.13,<2
+wfdb>=4.3,<5
+neurokit2>=0.3,<0.4
+edfio>=0.4.18,<0.5
+plotly>=7.1,<8
+pyyaml>=6.0,<7
+streamlit>=1.67,<2
+pytest>=9.2,<10
+-e .

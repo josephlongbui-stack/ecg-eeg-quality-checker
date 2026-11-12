@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signal_quality"
+version = "0.1.0"
+description = "Explainable recording-quality (artifact) checks for ECG and EEG signals."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Joseph Bui" }]
+dependencies = [
+    "numpy>=2.5,<3",
+    "scipy>=1.18,<2",
+    "pandas>=3.1,<4",
+    "mne>=1.13,<2",
+    "wfdb>=4.3,<5",
+    "neurokit2>=0.3,<0.4",
+    "edfio>=0.4.18,<0.5",
+    "plotly>=7.1,<8",
+    "pyyaml>=6.0,<7",
+]
+
+[project.optional-dependencies]
+app = ["streamlit>=1.67,<2"]
+dev = ["pytest>=9.2,<10"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
