@@ -19,14 +19,14 @@ from signal_quality import __version__
 from signal_quality.analyze import analyze_recording
 from signal_quality.config import default_config
 from signal_quality.demo import SIMULATED_LABEL, list_scenarios, make_scenario
-from signal_quality.io import ValidationError, load_file, peek_channel_names, suggest_signal_type
+from signal_quality.io import ValidationError, load_file, mark_simulated, peek_channel_names, suggest_signal_type
 from signal_quality.plotting import (
     SEVERITY_COLORS,
     findings_by_category_figure,
     timeline_figure,
     waveform_figure,
 )
-from signal_quality.reporting import to_csv_bytes, to_dataframe, to_json_bytes
+from signal_quality.reporting import to_csv_bytes, to_dataframe, to_html_bytes, to_json_bytes
 
 st.set_page_config(layout="wide", page_title="ECG/EEG Signal Quality Checker")
 
@@ -60,14 +60,27 @@ def _named_buffer(content: bytes, name: str) -> io.BytesIO:
     return buffer
 
 
+def _as_loader_input(files: tuple):
+    """files = ((name, bytes), ...): one CSV/EDF, or a WFDB .hea + .dat set."""
+    if any(name.lower().endswith(".hea") for name, _ in files):
+        return list(files)
+    if len(files) != 1:
+        raise ValidationError("Upload one .csv or .edf file, or a WFDB .hea + .dat pair.")
+    name, content = files[0]
+    return _named_buffer(content, name)
+
+
 @st.cache_data(show_spinner="Reading channel names…")
-def cached_peek(content: bytes, name: str) -> list[str]:
-    return peek_channel_names(_named_buffer(content, name))
+def cached_peek(files: tuple) -> list[str]:
+    target = _as_loader_input(files)
+    return peek_channel_names(target)
 
 
 @st.cache_data(show_spinner="Loading and analyzing file…")
-def cached_upload_analysis(content: bytes, name: str, signal_type: str, sfreq, unit, overrides: tuple):
-    recording = load_file(_named_buffer(content, name), signal_type=signal_type, sfreq=sfreq, unit=unit)
+def cached_upload_analysis(files: tuple, signal_type: str, sfreq, unit, missing: str, simulated: bool, overrides: tuple):
+    recording = load_file(_as_loader_input(files), signal_type=signal_type, sfreq=sfreq, unit=unit, missing=missing)
+    if simulated:
+        recording = mark_simulated(recording)
     return recording, [], analyze_recording(recording, config=dict(overrides))
 
 
@@ -108,6 +121,14 @@ def advanced_settings(signal_type: str) -> dict:
     return overrides
 
 
+def _request_key(request: tuple) -> tuple:
+    """Small hashable identity of what was analyzed (file names + sizes, not the bytes)."""
+    if request[0] == "demo":
+        return request
+    _, files, *rest = request
+    return ("upload", tuple((n, len(b)) for n, b in files), *rest)
+
+
 def file_stub(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "-", text).strip("-") or "recording"
 
@@ -130,26 +151,39 @@ if source == DEMO:
     signal_type = SCENARIOS[scenario_id]["signal_type"]
     request = ("demo", scenario_id)
 else:
-    uploaded = st.sidebar.file_uploader("CSV or EDF file (max 50 MB)", type=["csv", "edf"])
-    if uploaded is not None:
-        content = uploaded.getvalue()
+    uploads = st.sidebar.file_uploader(
+        "CSV, EDF, or WFDB .hea + .dat (max 50 MB)", type=["csv", "edf", "hea", "dat"], accept_multiple_files=True,
+        help="For PhysioNet WFDB records, select the .hea and .dat files together.",
+    )
+    if uploads:
+        files = tuple((u.name, u.getvalue()) for u in uploads)
+        first_name = files[0][0] if len(files) == 1 else next((n for n, _ in files if n.lower().endswith(".hea")), files[0][0])
         suggestion = "EEG"
         try:
-            suggestion = suggest_signal_type(cached_peek(content, uploaded.name))
+            suggestion = suggest_signal_type(cached_peek(files))
         except ValidationError as exc:
             st.sidebar.error(str(exc))
         signal_type = st.sidebar.radio(
             "Signal type", ["ECG", "EEG"], index=["ECG", "EEG"].index(suggestion), horizontal=True,
-            key=f"stype_{uploaded.name}", help=f"Suggested from channel names: {suggestion}. Please confirm.",
+            key=f"stype_{first_name}", help=f"Suggested from channel names: {suggestion}. Please confirm.",
+        )
+        missing = "flag" if st.sidebar.checkbox(
+            "Report NaN/Inf gaps as missing-data findings", value=False,
+            help="Off: files with NaN/Inf values are rejected with an explanation. On: each gap becomes a "
+                 "'missing data' finding and the other checks bridge it.",
+        ) else "reject"
+        simulated = st.sidebar.checkbox(
+            "This file is simulated (not a real recording)", value=first_name.lower().startswith("simulated"),
+            help="Labels the results 'Simulated' everywhere. The example files in examples/ are simulated.",
         )
         sfreq = unit = None
-        if uploaded.name.lower().endswith(".csv"):
+        if len(files) == 1 and first_name.lower().endswith(".csv"):
             st.sidebar.caption("CSV: one column per channel, header row = channel names; optional first column `time`.")
             sfreq = st.sidebar.number_input("Sampling rate (Hz)", min_value=0.0, value=None, placeholder="e.g. 256")
             unit = st.sidebar.selectbox("Unit", ["V", "mV", "µV"], index=None, placeholder="Choose the unit")
-        request = ("upload", content, uploaded.name, signal_type, sfreq, unit)
+        request = ("upload", files, signal_type, sfreq, unit, missing, simulated)
     else:
-        st.sidebar.info("Upload a .csv or .edf file to analyze it.")
+        st.sidebar.info("Upload a .csv or .edf file, or a WFDB .hea + .dat pair, to analyze it.")
 
 mains = st.sidebar.radio("Mains frequency", list(MAINS_LABELS), format_func=MAINS_LABELS.get, key="mains", horizontal=True)
 overrides = {"mains_hz": mains} if mains != "60" else {}
@@ -166,10 +200,10 @@ if (analyze_clicked or run_now) and request is not None:
         if request[0] == "demo":
             recording, injected, result = cached_demo_analysis(request[1], overrides_key)
         else:
-            _, content, name, stype, sfreq, unit = request
-            recording, injected, result = cached_upload_analysis(content, name, stype, sfreq, unit, overrides_key)
+            _, files, stype, sfreq, unit, missing, simulated = request
+            recording, injected, result = cached_upload_analysis(files, stype, sfreq, unit, missing, simulated, overrides_key)
         st.session_state.update(recording=recording, injected=injected, result=result,
-                                analysis_key=(request[:2] if request[0] == "demo" else request[2:], overrides_key))
+                                analysis_key=(_request_key(request), overrides_key))
     except ValidationError as exc:
         st.session_state["error"] = str(exc)
         for key in ("recording", "injected", "result"):
@@ -190,7 +224,7 @@ if st.session_state.get("error"):
     st.error(st.session_state["error"])
 current_key = None
 if request is not None:
-    current_key = (request[:2] if request[0] == "demo" else request[2:], overrides_key)
+    current_key = (_request_key(request), overrides_key)
 if result is not None and current_key is not None and current_key != st.session_state.get("analysis_key"):
     st.info("The data source or settings changed. Press **Analyze** to update the results.")
 
@@ -219,7 +253,9 @@ with tabs[0]:
         st.markdown("**What it detects**")
         st.markdown(
             "- Flatline / disconnected channel\n- Clipping (amplifier saturation)\n"
-            "- Power-line interference (50/60 Hz)\n- Sudden spikes and discontinuities\n- Baseline drift / wander"
+            "- Power-line interference (50/60 Hz)\n- Sudden spikes and discontinuities\n- Baseline drift / wander\n"
+            "- Noisy channel, muscle / high-frequency noise\n- Possible eye blinks (EEG), electrode motion (ECG)\n"
+            "- Missing data (NaN gaps)\n- Physiological plausibility **hints** (always *uncertain*)"
         )
     with c2, st.container(border=True):
         st.markdown("**How it works**")
@@ -264,11 +300,15 @@ with tabs[1]:
             shown = [st.selectbox("Lead", names)]
         else:
             shown = st.multiselect("Channels (stacked)", names, default=names[:4]) or names[:1]
+        show_processed = st.toggle(
+            "Show processed signal", value=False,
+            help="Overlays a 0.5–40 Hz band-pass filtered copy for viewing only. Analysis always uses the raw signal.",
+        )
         show_truth = False
         if injected:
             show_truth = st.checkbox("Show injected-artifact ground truth", value=False,
                                      help="Green outlines show where artifacts were injected, to compare injected vs detected.")
-        fig, downsampled = waveform_figure(recording, result, shown, injected, show_truth)
+        fig, downsampled = waveform_figure(recording, result, shown, injected, show_truth, show_processed=show_processed)
         st.plotly_chart(fig, width="stretch")
         notes = ["Red shading = flagged interval (border: solid = definite, dashed = likely, dotted = uncertain)."]
         if downsampled:
@@ -359,12 +399,14 @@ with tabs[4]:
         stub = file_stub(summary["meta"].get("scenario_id") or summary["source"])
         base = f"{stub}_{summary['signal_type']}"
         st.markdown("Both files include the recording metadata (no patient-identifying fields), the exact settings used and the package version.")
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         c1.download_button("Findings (CSV)", to_csv_bytes(result), file_name=f"{base}_findings_{stamp}.csv",
                            mime="text/csv", width="stretch")
         c2.download_button("Full results (JSON)", to_json_bytes(result), file_name=f"{base}_results_{stamp}.json",
                            mime="application/json", width="stretch")
-        st.caption("HTML report export is planned for a later phase.")
+        c3.download_button("HTML report", to_html_bytes(result, recording, injected), file_name=f"{base}_report_{stamp}.html",
+                           mime="text/html", width="stretch")
+        st.caption("The HTML report includes an interactive waveform (it loads the Plotly library from the internet when opened).")
 
 # ------------------------------------------------------------------ About / Evaluation
 with tabs[5]:
@@ -385,6 +427,15 @@ with tabs[5]:
              f"|Δx| > {ecg.spike_factor:g} × P99(|Δx|); near an R-peak → uncertain"),
             ("Baseline drift", f"ptp of < {eeg.drift_cutoff_hz} Hz component ≥ {eeg.drift_ptp_uV:g} µV",
              f"ptp of < {ecg.drift_cutoff_hz} Hz component ≥ {ecg.drift_ptp_mV} mV"),
+            ("Noisy channel", f"robust σ (> 1 Hz) > {eeg.noisy_ratio:g}× the median of the other channels (needs ≥ 4 channels)", "—"),
+            ("Muscle / high-frequency", f"power 20–45 Hz > {eeg.muscle_ratio:g} of 1–45 Hz power",
+             f"power > 40 Hz > {ecg.hf_ratio:g}× power 1–40 Hz (50/60 Hz excluded)"),
+            ("Ocular (EEG) / electrode motion (ECG)",
+             f"0.5–4 Hz deflection ≥ {eeg.ocular_ptp_uV:g} µV on Fp/AF and ≥ {eeg.ocular_frontal_ratio:g}× posterior; never definite",
+             "≥ 2 of: drift, abrupt jump, beat detection failing locally"),
+            ("Missing data", "NaN/Inf runs (when the option is on)", "same"),
+            ("Plausibility hints (uncertain only)", f"robust amplitude > {eeg.plaus_amp_uV:g} µV for ≥ 2 s",
+             f"heart rate outside {ecg.plaus_hr_min_bpm:g}–{ecg.plaus_hr_max_bpm:g} bpm, RR < 200 ms, or > 3 s without a beat"),
         ],
         columns=["Detector", "EEG rule", "ECG rule"],
     )

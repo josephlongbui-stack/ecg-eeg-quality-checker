@@ -129,6 +129,28 @@ def _step(x: np.ndarray, sfreq: float, t_s: float, amp_V: float) -> None:
     x[_idx(t_s, sfreq) :] += amp_V
 
 
+def _band_noise(n: int, sfreq: float, lo: float, hi: float, rms: float, rng: np.random.Generator) -> np.ndarray:
+    """Gaussian noise limited to [lo, hi] Hz with the given RMS (e.g. muscle/EMG-like noise)."""
+    spectrum = np.fft.rfft(rng.standard_normal(n))
+    freqs = np.fft.rfftfreq(n, 1 / sfreq)
+    spectrum[(freqs < lo) | (freqs > hi)] = 0
+    y = np.fft.irfft(spectrum, n)
+    return rms * y / np.sqrt(np.mean(y**2))
+
+
+def _add_burst(x: np.ndarray, sfreq: float, noise: np.ndarray, start_s: float, end_s: float) -> None:
+    """Add `noise` only during [start, end) with 0.1 s fade-in/out (no artificial steps)."""
+    t = _time(len(x), sfreq)
+    env = np.clip(np.minimum((t - start_s) / 0.1, (end_s - t) / 0.1), 0, 1)
+    x += env * noise
+
+
+def _blink(x: np.ndarray, sfreq: float, t_s: float, amp_V: float, width_s: float = 0.07) -> None:
+    """Eye blink: a smooth positive bump (~0.3 s wide) strongest at the frontal-polar electrodes."""
+    t = _time(len(x), sfreq)
+    x += amp_V * np.exp(-0.5 * ((t - t_s) / width_s) ** 2)
+
+
 # ---------------------------------------------------------------- scenarios
 def _ecg(seed: int, kind: str) -> tuple[np.ndarray, list[InjectedArtifact]]:
     data = _ecg_base(seed)
@@ -150,6 +172,23 @@ def _ecg(seed: int, kind: str) -> tuple[np.ndarray, list[InjectedArtifact]]:
     if kind == "clipping":
         limit = _saturate(x, fs, 5.0, 9.0, gain=2.5)
         truth.append(InjectedArtifact(ECG_CHANNEL, 5.0, 9.0, "clipping", {"gain": 2.5, "limit_mV": limit * 1e3}))
+    if kind == "muscle_noise":
+        rng = np.random.default_rng(seed + 1)
+        _add_burst(x, fs, _band_noise(len(x), fs, 20.0, 150.0, 0.2e-3, rng), 8.0, 16.0)
+        truth.append(InjectedArtifact(ECG_CHANNEL, 8.0, 16.0, "hf_noise", {"band_hz": [20, 150], "rms_mV": 0.2}))
+    if kind == "electrode_motion":
+        rng = np.random.default_rng(seed + 2)
+        wander = _band_noise(len(x), fs, 0.05, 0.5, 0.5e-3, rng)
+        _add_burst(x, fs, wander, 18.0, 24.0)
+        for t0 in (19.5, 22.0):  # cable tugs: sudden shift that relaxes over ~0.5 s
+            t = _time(len(x), fs)
+            m = t >= t0
+            x[m] += 0.8e-3 * np.exp(-(t[m] - t0) / 0.5)
+        truth.append(InjectedArtifact(ECG_CHANNEL, 18.0, 24.0, "electrode_motion", {"wander_rms_mV": 0.5, "jumps_mV": 0.8}))
+    if kind == "missing":
+        a, b = _idx(20.0, fs), _idx(22.0, fs)
+        x[a:b] = np.nan
+        truth.append(InjectedArtifact(ECG_CHANNEL, 20.0, 22.0, "missing_data", {"value": "NaN"}))
     if kind in ("spikes", "mixed"):
         times = [6.2, 11.7, 18.4, 25.1] if kind == "spikes" else [10.5, 22.3]
         for t in times:
@@ -184,6 +223,20 @@ def _eeg(seed: int, kind: str) -> tuple[np.ndarray, list[InjectedArtifact]]:
     if kind == "clipping":
         limit = _saturate(data[ch["O2"]], fs, 18.0, 24.0, gain=3.0)
         truth.append(InjectedArtifact("O2", 18.0, 24.0, "clipping", {"gain": 3.0, "limit_uV": limit * 1e6}))
+    if kind == "noisy_channel":
+        rng = np.random.default_rng(seed + 3)
+        data[ch["C4"]] += 120e-6 * _pink_noise(data.shape[1], fs, rng)  # loose electrode: broadband noise
+        truth.append(InjectedArtifact("C4", 0.0, EEG_DURATION_S, "noisy_channel", {"extra_noise_rms_uV": 120}))
+    if kind == "muscle":
+        rng = np.random.default_rng(seed + 4)
+        _add_burst(data[ch["F3"]], fs, _band_noise(data.shape[1], fs, 20.0, 100.0, 45e-6, rng), 10.0, 20.0)
+        truth.append(InjectedArtifact("F3", 10.0, 20.0, "muscle", {"band_hz": [20, 100], "rms_uV": 45}))
+    if kind == "ocular":
+        for t0 in (4.0, 9.5, 16.2, 23.8):
+            for name, scale in (("Fp1", 1.0), ("Fp2", 1.0), ("F3", 0.35), ("F4", 0.35), ("C3", 0.1), ("C4", 0.1)):
+                _blink(data[ch[name]], fs, t0, 150e-6 * scale)
+            for name in ("Fp1", "Fp2"):
+                truth.append(InjectedArtifact(name, t0 - 0.25, t0 + 0.25, "ocular", {"blink_amplitude_uV": 150}))
     return data, truth
 
 
@@ -201,6 +254,13 @@ SCENARIOS: dict[str, tuple[str, str, Callable[[int], tuple[np.ndarray, list[Inje
     "eeg_drift": ("EEG — baseline drift", "EEG", lambda s: _eeg(s, "drift")),
     "eeg_clipping": ("EEG — clipping", "EEG", lambda s: _eeg(s, "clipping")),
     "mixed_ecg": ("ECG — mixed (power line + spikes + dropout)", "ECG", lambda s: _ecg(s, "mixed")),
+    # Phase 2 scenarios
+    "ecg_muscle_noise": ("ECG — muscle / high-frequency noise", "ECG", lambda s: _ecg(s, "muscle_noise")),
+    "ecg_electrode_motion": ("ECG — electrode motion", "ECG", lambda s: _ecg(s, "electrode_motion")),
+    "ecg_missing_data": ("ECG — missing data (NaN gap)", "ECG", lambda s: _ecg(s, "missing")),
+    "eeg_noisy_channel": ("EEG — noisy channel", "EEG", lambda s: _eeg(s, "noisy_channel")),
+    "eeg_muscle": ("EEG — muscle contamination", "EEG", lambda s: _eeg(s, "muscle")),
+    "eeg_ocular": ("EEG — eye blinks (ocular)", "EEG", lambda s: _eeg(s, "ocular")),
 }
 
 
@@ -231,6 +291,8 @@ def make_scenario(scenario_id: str, seed: int = 42) -> tuple[Recording, list[Inj
             "original_unit": "V (simulated)",
             "seed": seed,
             "label": SIMULATED_LABEL,
+            # the NaN-gap demo shows the "mark missing data" option; others never contain NaN
+            "missing_policy": "flag" if scenario_id == "ecg_missing_data" else "reject",
         },
     )
     return recording, truth

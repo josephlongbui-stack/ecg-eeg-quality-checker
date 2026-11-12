@@ -6,10 +6,9 @@ steep, so a robust z-score would flag every heartbeat.
 
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 
+from ..beats import find_r_peaks
 from ..config import BaseConfig
 from ..features import first_difference, robust_sigma
 from ..models import Finding
@@ -17,25 +16,6 @@ from .flatline import flat_mask
 from .common import DetectorOutput, fmt, safe_ratio, severity, to_display, unit_key
 
 NAME = "spikes@1.0"
-
-
-def _find_r_peaks(x: np.ndarray, sfreq: float) -> np.ndarray | None:
-    """R-peak sample indices from NeuroKit2, or None if detection fails.
-
-    Failure is NOT treated as an artifact or an arrhythmia; the cross-check is skipped.
-    """
-    try:
-        import neurokit2 as nk
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            rate = int(round(sfreq))
-            cleaned = nk.ecg_clean(x, sampling_rate=rate)
-            _, info = nk.ecg_peaks(cleaned, sampling_rate=rate)
-        peaks = np.asarray(info["ECG_R_Peaks"], dtype=int)
-        return peaks if peaks.size > 0 else None
-    except Exception:
-        return None
 
 
 def _group(indices: np.ndarray, max_gap: int) -> list[np.ndarray]:
@@ -90,7 +70,8 @@ def detect(x: np.ndarray, sfreq: float, channel: str, config: BaseConfig, meta: 
 
     r_peaks = None
     if config.signal_type == "ECG":
-        r_peaks = _find_r_peaks(x, sfreq)
+        meta = meta or {}
+        r_peaks = meta["r_peaks"] if "r_peaks" in meta else find_r_peaks(x, sfreq)
         if r_peaks is None:
             out.skipped.append(
                 {

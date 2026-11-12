@@ -10,3 +10,4 @@ reports/*.tmp
 
 # Private project background (not for the public repo)
 context/
+results/

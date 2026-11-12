@@ -16,6 +16,7 @@ TRACE_COLOR = "#2B3A4A"
 FLAG_FILL = "rgba(200, 40, 40, 0.18)"
 FLAG_LINE = "rgba(200, 40, 40, 0.85)"
 TRUTH_LINE = "rgba(30, 140, 60, 0.95)"
+PROCESSED_COLOR = "rgba(31, 78, 121, 0.75)"
 CERTAINTY_DASH = {"definite": "solid", "likely": "dash", "uncertain": "dot"}
 SEVERITY_COLORS = {"low": "#6B7B8C", "medium": "#C77700", "high": "#B3261E"}
 DISPLAY = {"EEG": ("µV", 1e6), "ECG": ("mV", 1e3)}
@@ -39,10 +40,23 @@ def minmax_decimate(t: np.ndarray, y: np.ndarray, max_points: int = 20000) -> tu
         if b <= a:
             continue
         seg = y[a:b]
-        i_min, i_max = a + int(np.argmin(seg)), a + int(np.argmax(seg))
+        if np.all(np.isnan(seg)):  # keep a gap visible where data is missing
+            idx.append(a)
+            continue
+        i_min, i_max = a + int(np.nanargmin(seg)), a + int(np.nanargmax(seg))
         idx.extend(sorted((i_min, i_max)))
     idx = np.array(idx)
     return t[idx], y[idx], True
+
+
+def processed_view(y: np.ndarray, sfreq: float) -> np.ndarray | None:
+    """0.5–40 Hz band-pass copy for display only (None if the segment is too short or has gaps)."""
+    from .preprocessing import bandpass
+
+    hi = min(40.0, 0.45 * sfreq)
+    if len(y) < 4 * sfreq or not np.all(np.isfinite(y)) or hi <= 1.0:
+        return None
+    return bandpass(y, sfreq, 0.5, hi)
 
 
 def _rect(x0: float, x1: float, y0: float, y1: float) -> tuple[list[float], list[float]]:
@@ -65,10 +79,12 @@ def waveform_figure(
     time_range: tuple[float, float] | None = None,
     max_points: int = 20000,
     height: int | None = None,
+    show_processed: bool = False,
 ) -> tuple[go.Figure, bool]:
     """Waveform with shaded findings. Several channels are stacked with vertical offsets.
 
-    Returns (figure, was_downsampled).
+    show_processed overlays a 0.5–40 Hz band-pass filtered copy FOR VIEWING ONLY;
+    analysis always uses the raw signal. Returns (figure, was_downsampled).
     """
     unit, scale = display_unit(recording.signal_type)
     channels = channels or recording.channel_names[:1]
@@ -83,11 +99,11 @@ def waveform_figure(
 
     stacked = len(channels) > 1
     if stacked:
-        spreads = [np.subtract(*np.percentile(y, [99.5, 0.5])) for y in traces if len(y)]
+        spreads = [np.subtract(*np.nanpercentile(y, [99.5, 0.5])) for y in traces if np.isfinite(y).any()]
         spacing = float(max(spreads)) if spreads else 1.0
-        spacing = spacing if spacing > 0 else 1.0
+        spacing = spacing if np.isfinite(spacing) and spacing > 0 else 1.0
         offsets = [(len(channels) - 1 - k) * spacing for k in range(len(channels))]
-        centers = [float(np.median(y)) if len(y) else 0.0 for y in traces]
+        centers = [float(np.nanmedian(y)) if np.isfinite(y).any() else 0.0 for y in traces]
     else:
         spacing = 0.0
         offsets, centers = [0.0], [0.0]
@@ -106,10 +122,21 @@ def waveform_figure(
                 showlegend=False, hovertemplate=f"{ch}<br>%{{x:.3f}} s<extra></extra>",
             )
         )
+        if show_processed:
+            proc = processed_view(y, recording.sfreq)
+            if proc is not None:
+                tp, yp, _ = minmax_decimate(t, proc - np.nanmedian(proc) + off, per_trace_points)
+                fig.add_trace(
+                    go.Scattergl(
+                        x=tp, y=yp, mode="lines", line=dict(color=PROCESSED_COLOR, width=1),
+                        name="Processed (0.5–40 Hz, display only)", legendgroup="processed",
+                        showlegend=ch == channels[0], hoverinfo="skip",
+                    )
+                )
         if stacked:
             bands[ch] = (off - spacing / 2, off + spacing / 2)
         else:
-            lo, hi = (float(np.min(yy)), float(np.max(yy))) if len(yy) else (0.0, 1.0)
+            lo, hi = (float(np.nanmin(yy)), float(np.nanmax(yy))) if np.isfinite(yy).any() else (0.0, 1.0)
             pad = 0.05 * (hi - lo if hi > lo else 1.0)
             bands[ch] = (lo - pad, hi + pad)
 

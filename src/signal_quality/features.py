@@ -84,3 +84,14 @@ def longest_run(mask: np.ndarray) -> int:
     """Length of the longest run of consecutive True values."""
     runs = runs_of_true(mask)
     return max((stop - start for start, stop in runs), default=0)
+
+
+def integrated_power(freqs: np.ndarray, psd: np.ndarray, lo: float, hi: float, exclude: list[tuple[float, float]] | None = None) -> float:
+    """Total power between lo and hi Hz (sum of PSD × bin width), optionally skipping excluded bands."""
+    mask = (freqs >= lo) & (freqs <= hi)
+    for a, b in exclude or []:
+        mask &= ~((freqs >= a) & (freqs <= b))
+    if not mask.any():
+        return 0.0
+    df = float(freqs[1] - freqs[0]) if len(freqs) > 1 else 1.0
+    return float(np.sum(psd[mask]) * df)

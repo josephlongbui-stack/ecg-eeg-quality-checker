@@ -61,16 +61,39 @@ def _inside(inner: Finding, outer: Finding) -> bool:
     )
 
 
-def suppress_findings(findings: list[Finding]) -> list[Finding]:
-    """Rules 2–3: flatline hides drift/spike/clipping inside it; clipping hides spikes inside it.
+# Categories that are side effects when they sit fully inside a flat stretch.
+FLAT_SUPPRESSES = SPIKE_FAMILY | {
+    "baseline_drift", "clipping", "muscle", "hf_noise", "noisy_channel", "ocular",
+    "electrode_motion", "implausible_rhythm_measurement", "implausible_amplitude",
+}
+MISSING_PAD_S = 0.5  # findings within a gap (± 0.5 s) were computed on bridged values
 
+
+def _inside_padded(inner: Finding, outer: Finding, pad: float) -> bool:
+    return (
+        inner.channel == outer.channel
+        and inner.start_s >= outer.start_s - pad
+        and inner.end_s <= outer.end_s + pad
+    )
+
+
+def suppress_findings(findings: list[Finding]) -> list[Finding]:
+    """Suppression rules.
+
+    1. Missing data hides any other finding inside the gap (± 0.5 s): those came from bridged values.
+    2. Flatline hides drift / spike / clipping (and the Phase 2 noise / hint categories) inside it.
+    3. Clipping hides spikes inside it.
+    4. Muscle / high-frequency noise hides spikes inside it (the steep jumps ARE the noise).
     Other overlapping categories stay as separate findings (they are different evidence).
     """
+    gaps = [f for f in findings if f.category == "missing_data"]
     flats = [f for f in findings if f.category == "flatline"]
-    clips = [f for f in findings if f.category == "clipping"]
+    clips = [f for f in findings if f.category in ("clipping", "muscle", "hf_noise")]
     kept = []
     for f in findings:
-        if f.category in SPIKE_FAMILY | {"baseline_drift", "clipping"} and any(_inside(f, fl) for fl in flats):
+        if f.category != "missing_data" and any(_inside_padded(f, g, MISSING_PAD_S) for g in gaps):
+            continue
+        if f.category in FLAT_SUPPRESSES and any(_inside(f, fl) for fl in flats):
             continue
         if f.category in SPIKE_FAMILY and any(_inside(f, c) for c in clips):
             continue

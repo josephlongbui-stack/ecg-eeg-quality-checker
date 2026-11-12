@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..config import BaseConfig
-from ..features import longest_run
+from ..features import longest_run, runs_of_true
 from ..models import Finding
 from ..preprocessing import iter_windows
 from .common import DetectorOutput, fmt, safe_ratio, severity, to_display, unit_key
@@ -44,7 +44,8 @@ def detect(x: np.ndarray, sfreq: float, channel: str, config: BaseConfig, meta: 
             win_mask = mask[start:stop]
             frac = float(np.mean(win_mask))
             run = longest_run(win_mask)
-            if frac < config.clip_min_fraction or run < min_run:
+            n_runs = sum(1 for a, b in runs_of_true(win_mask) if b - a >= min_run)
+            if frac < config.clip_min_fraction or run < min_run or n_runs < config.clip_min_runs:
                 continue
             at_declared = declared is not None
             if run < 2 * min_run:
@@ -68,12 +69,13 @@ def detect(x: np.ndarray, sfreq: float, channel: str, config: BaseConfig, meta: 
                         f"≥ {config.clip_min_fraction * 100:g}% of window within "
                         f"{config.clip_tolerance_frac * 100:g}% of range of the "
                         f"{'declared' if at_declared else 'observed'} {side}, "
-                        f"with a flat run ≥ {min_run} samples"
+                        f"in ≥ {config.clip_min_runs} flat runs of ≥ {min_run} samples"
                     ),
                     measurement={
                         "side": side,
                         "fraction_at_extreme_pct": frac * 100,
                         "longest_run_samples": run,
+                        "runs_at_extreme": n_runs,
                         f"extreme_value_{uk}": to_display(level, config),
                         "threshold_fraction_pct": config.clip_min_fraction * 100,
                         "threshold_run_samples": min_run,

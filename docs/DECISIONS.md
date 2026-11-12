@@ -35,3 +35,40 @@ Minor decisions made while building, with the reason for each. Scientific-thresh
 ### App
 - The CSV export starts with `#` comment lines holding the metadata, config and version. Read it with `pandas.read_csv(path, comment="#")`.
 - The JSON/CSV exports never include EDF patient fields. Only file name, unit, duration, scenario info and warnings are kept (`analyze.SAFE_META_KEYS`).
+
+## Phase 2 (2026-11-12)
+
+### New detectors: choices DETECTORS.md left open
+- **Detector types.** Per-channel detectors keep the Phase 1 signature. Noisy-channel and ocular checks compare channels, so they are "multi-channel" detectors (`detect(data, sfreq, channel_names, config)`). Electrode motion combines other detectors' findings, so `analyze.py` runs it last for each ECG channel.
+- **Noisy channel** compares robust σ **above 1 Hz** (`noisy_highpass_hz`). On the raw signal, a slow 0.1 Hz drift (eeg_drift) and a 200 µV step (eeg_spikes) each made a channel look "5× noisier", which duplicated the drift and discontinuity findings. It runs per analysis window, so it can localize a contact that comes and goes.
+- **EEG muscle** uses integrated (summed) power, not mean PSD. The upper edge is min(45 Hz, Nyquist − 5 Hz). It is skipped when that leaves less than a 5 Hz band. Certainty is `likely`; the wording says "possible muscle".
+- **ECG high-frequency noise** excludes ±2 Hz around 50/60 Hz and their harmonics. Pure power-line hum is the power-line detector's job and must not also count as broadband noise (tested). The high band runs up to Nyquist.
+- **Ocular**
+  - **Band:** it uses a 0.5–4 Hz band-pass (the spec says "< 4 Hz"), so slow drift below 0.5 Hz, which has its own detector, isn't called an eye artifact (tested with a 0.1 Hz frontal drift).
+  - **Rule:** frontal (Fp/AF) ptp ≥ 100 µV **and** ≥ `ocular_frontal_ratio` × the median of the posterior channels (O/PO/P). If no posterior channels exist, the median of all non-frontal channels is used.
+  - **Certainty:** `likely` when ≥ 2 frontal channels agree in the window (blinks are bilateral); otherwise `uncertain`. Never `definite`.
+  - **Threshold 2× (was 3× in my first draft):** chosen on **simulated** data. At 3×, 116/240 simulated 150 µV blinks were detected; at 2×, 239/240. Clean EEG gave 0 false ocular findings in 30 recordings at either value. Phase 3 must re-check this on a separate tuning split of real data.
+- **Electrode motion.** Indicators per ECG window: baseline drift, a spike/discontinuity/large transient, and "no beats detected while the nearest **non-overlapping** windows before and after have beats". Overlapping neighbours share the gap, so they can't serve as the comparison. A finding needs ≥ 2 indicators (`likely`). Beat-detection failure alone gives an `uncertain` finding. Drift alone or a jump alone is **not** reported again as electrode motion, since its own detector already reports it. The indicators come from findings **after** suppression, so a jump hidden inside a dropout doesn't count.
+- **Missing data** stays off by default ("reject", as in Phase 1). With `missing="flag"` (loader argument, CLI `--missing flag`, app checkbox), each NaN/Inf run becomes a `definite` `missing_data` finding. The gap is bridged by a straight line so the other checks can run, and any other finding within the gap ± 0.5 s is suppressed. A channel with no valid samples is reported and skipped.
+- **Physiological plausibility (ECG)**
+  - **Beats:** NeuroKit2 R-peaks are computed once per channel and shared with the spike and electrode-motion checks.
+  - **Rules:** each RR < 200 ms, each beat-free gap > 3 s (including from the recording edges), and each window whose median-RR heart rate falls outside 25–250 bpm.
+  - **Exclusions:** gaps or windows that are ≥ 50% flat or missing are skipped, because the dropout is already reported.
+  - **Labels and wording:** all hints are `uncertain`, with severity capped at `medium`. The wording is tested against a list of forbidden words.
+- **Physiological plausibility (EEG):** windows with robust amplitude > 200 µV, merged into stretches; reported only if ≥ 2 s.
+
+### Changes to Phase 1 behaviour found while building Phase 2
+- **Clipping now also needs ≥ 2 separate flat runs at the extreme in the window** (`clip_min_runs = 2`). The electrode-motion demo exposed a false "clipping" finding. Every channel's single global minimum sat at the bottom of a slow, smooth trough, where 18 consecutive samples were within 0.1% of the extreme. Real clipping repeats peak after peak. A single long stuck stretch is constant, so the flatline detector reports it. With this rule, 20 seeds × 19 scenarios gave 0 clipping findings outside the clipping scenarios, and all clipping scenarios were still detected.
+- **Muscle (EEG) and high-frequency noise (ECG) now suppress spike-type findings fully inside them**, as clipping does. An EMG burst is made of steep jumps, and without this rule it produced several "spike" findings for the same event. Trade-off: a genuine electrode pop inside a muscle burst is hidden.
+
+### Demo scenarios added (Phase 2)
+`ecg_muscle_noise` (20–150 Hz noise, 0.2 mV RMS, 8–16 s) · `ecg_electrode_motion` (0.05–0.5 Hz wander, 0.5 mV RMS, 18–24 s, plus two 0.8 mV tugs relaxing over 0.5 s) · `ecg_missing_data` (NaN 20–22 s; this demo uses the "flag" option) · `eeg_noisy_channel` (C4 + 120 µV RMS pink noise) · `eeg_muscle` (F3, 20–100 Hz, 45 µV RMS, 10–20 s) · `eeg_ocular` (four 150 µV blinks on Fp1/Fp2, weaker on F3/F4/C3/C4).
+- **Robustness over 20 seeds × 19 scenarios:** 1 extra flag on clean signals (the same NeuroKit2 seed-5 slow ECG swing as in Phase 1). Electrode motion was missed in 1 of 20 seeds (the wander stayed under the drift threshold). 2 of 40 EEG pops were labelled `large_transient` (as in Phase 1). The app uses seed 42, where every injected artifact is found.
+
+### Other
+- **Uploaded files are labelled "Real recording" unless the user says they are simulated:** app checkbox (pre-ticked for file names starting with "simulated"), CLI `--simulated`. A loader can't know where the data came from.
+- **`examples/`** holds three small simulated files (CSV, EDF, WFDB), made by `scripts/make_examples.py`, so the README commands run verbatim.
+- **HTML report:** one page with metadata, findings, skipped checks, settings and an interactive waveform. Plotly is loaded from its CDN, which keeps the file around 0.3 MB instead of about 4 MB, so the waveform needs internet; the tables don't.
+- **"Show processed signal"** overlays a 0.5–40 Hz band-pass copy **for display only**.
+- **Large recordings** get a note above 30 min of data at more than 250 Hz. Measured on this Mac: 30 min of 2-lead ECG at 360 Hz took 1.3 s; 30 min of 19-channel EEG at 256 Hz took 15 s, with a peak memory of about 630 MB for the whole Python process.
+- **CI:** `actions/checkout@v7` and `actions/setup-python@v7`; v4/v5 used the deprecated Node 20 runtime.

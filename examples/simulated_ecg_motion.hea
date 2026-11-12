@@ -1,0 +1,4 @@
+simulated_ecg_motion 2 360 10800
+simulated_ecg_motion.dat 16 20272.107282073026(-8065)/mV 16 0 13900 18520 0 MLII
+simulated_ecg_motion.dat 16 33786.845470121705(-8065)/mV 16 0 13900 18520 0 V1
+# Simulated signal - not a real recording

@@ -21,6 +21,8 @@ from .models import Recording
 MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB, matches .streamlit/config.toml
 MIN_DURATION_S = 1.0
 UNIT_TO_VOLTS = {"V": 1.0, "mV": 1e-3, "uV": 1e-6, "µV": 1e-6, "μV": 1e-6}
+MISSING_POLICIES = ("reject", "flag")  # NaN/Inf: reject the file, or report "missing data" findings
+ECG_LEAD_NAMES = {"I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6", "MLII", "ML2", "MLI", "MLIII"}
 TIME_COLUMNS = {"time", "time_s"}
 SIGNAL_TYPES = ("ECG", "EEG")
 
@@ -75,16 +77,31 @@ def unit_to_volts(unit: str | None) -> float:
 
 
 def suggest_signal_type(channel_names: list[str]) -> str:
-    """Suggest 'ECG' if any channel name mentions ECG/EKG, else 'EEG'. Only a suggestion."""
+    """Suggest 'ECG' if channel names mention ECG/EKG or are standard ECG leads, else 'EEG'.
+
+    Only a suggestion: the user always confirms the signal type.
+    """
     for name in channel_names:
-        upper = str(name).upper()
-        if "ECG" in upper or "EKG" in upper:
+        upper = str(name).upper().strip()
+        if "ECG" in upper or "EKG" in upper or upper in ECG_LEAD_NAMES:
             return "ECG"
     return "EEG"
 
 
+def _check_missing_policy(missing: str) -> str:
+    if missing not in MISSING_POLICIES:
+        raise ValidationError(f"Unknown missing-data option '{missing}'. Use 'reject' or 'flag'.")
+    return missing
+
+
 def peek_channel_names(file: Any) -> list[str]:
-    """Read only the channel names of a CSV or EDF file (used for suggestions in the app)."""
+    """Read only the channel names of a CSV, EDF or WFDB upload (used for suggestions in the app)."""
+    if isinstance(file, (list, tuple)):  # WFDB: [(name, bytes), ...] -> parse the .hea text
+        for name, content in file:
+            if str(name).lower().endswith(".hea"):
+                lines = [l for l in content.decode("utf-8", errors="replace").splitlines() if l.strip() and not l.startswith("#")]
+                return [" ".join(l.split()[8:]) or f"ch{i}" for i, l in enumerate(lines[1:])]
+        return []
     content, name = _read_bytes(file)
     _check_size(content)
     if name.lower().endswith(".edf"):
@@ -92,6 +109,14 @@ def peek_channel_names(file: Any) -> list[str]:
         return list(raw.ch_names)
     header = next(csv.reader(_stdio.StringIO(content.decode("utf-8-sig", errors="replace"))), [])
     return [h.strip() for h in header if h.strip().lower() not in TIME_COLUMNS]
+
+
+def mark_simulated(recording: Recording) -> Recording:
+    """Return a copy labelled as simulated (for uploaded files the user says are simulated)."""
+    from dataclasses import replace
+
+    meta = dict(recording.meta, label="Simulated signal — not a real recording")
+    return replace(recording, data_kind="simulated", meta=meta)
 
 
 # ---------------------------------------------------------------- validation
@@ -112,12 +137,16 @@ def validate(recording: Recording) -> Recording:
         dupes = sorted({c for c in recording.channel_names if recording.channel_names.count(c) > 1})
         raise ValidationError(f"Duplicate channel names: {dupes}. Each channel needs a unique name.")
     bad = ~np.isfinite(data)
-    if bad.any():
+    if recording.meta.get("missing_policy") == "flag":
+        if bad.all():
+            raise ValidationError("Every value in the recording is missing (NaN/Inf); there is nothing to analyze.")
+    elif bad.any():
         ch_idx, sample_idx = np.argwhere(bad)[0]
         raise ValidationError(
             f"Found {int(bad.sum())} missing or infinite values (NaN/Inf). The first is in channel "
             f"'{recording.channel_names[ch_idx]}' at sample {int(sample_idx)} "
-            f"({sample_idx / recording.sfreq:.3f} s). Please clean or remove them and try again."
+            f"({sample_idx / recording.sfreq:.3f} s). Please clean or remove them, or choose to mark them "
+            "as missing-data findings."
         )
     if recording.duration_s < MIN_DURATION_S:
         raise ValidationError(
@@ -132,14 +161,17 @@ def load_csv(
     sfreq: float | None,
     unit: str | None,
     signal_type: str | None,
+    missing: str = "reject",
 ) -> Recording:
     """Load a CSV: one column per channel, header row = channel names.
 
     An optional first column named `time` / `time_s` is not analyzed; it is only
     used to sanity-check the sampling rate (a warning if off by more than 1%).
     The sampling rate and unit must be given by the user; they are never guessed.
+    missing="flag" turns NaN/Inf values into "missing data" findings instead of an error.
     """
     signal_type = _check_signal_type(signal_type)
+    missing = _check_missing_policy(missing)
     if sfreq is None:
         raise ValidationError("Sampling rate is required for CSV files. Enter it in the sidebar (e.g., 256).")
     try:
@@ -208,6 +240,7 @@ def load_csv(
             "original_unit": str(unit),
             "duration_s": values.shape[1] / sfreq,
             "warnings": warnings,
+            "missing_policy": missing,
         },
     )
     return validate(recording)
@@ -230,7 +263,7 @@ def _read_edf_raw(content: bytes, preload: bool):
         return raw
 
 
-def load_edf(file: Any, signal_type: str | None) -> Recording:
+def load_edf(file: Any, signal_type: str | None, missing: str = "reject") -> Recording:
     """Load an EDF/EDF+ file with MNE (which returns volts).
 
     Patient-identifying header fields (name, birthdate, IDs, recording date) are
@@ -238,6 +271,7 @@ def load_edf(file: Any, signal_type: str | None) -> Recording:
     rate and the declared physical range (for clipping checks) are kept.
     """
     signal_type = _check_signal_type(signal_type)
+    missing = _check_missing_policy(missing)
     content, name = _read_bytes(file)
     _check_size(content)
     raw = _read_edf_raw(content, preload=True)
@@ -275,17 +309,114 @@ def load_edf(file: Any, signal_type: str | None) -> Recording:
             "duration_s": data.shape[1] / sfreq,
             "physical_range_V": physical_range,
             "warnings": [],
+            "missing_policy": missing,
         },
     )
     return validate(recording)
 
 
-def load_file(file: Any, signal_type: str | None, sfreq: float | None = None, unit: str | None = None) -> Recording:
-    """Dispatch on file extension (.csv or .edf)."""
+# ---------------------------------------------------------------- WFDB (PhysioNet)
+def _wfdb_unit_scale(unit: str, channel: str) -> float:
+    key = str(unit).strip()
+    lookup = {k.lower(): v for k, v in UNIT_TO_VOLTS.items()}
+    if key.lower() not in lookup:
+        raise ValidationError(
+            f"Channel '{channel}' has unit '{unit}' in the WFDB header. Only V, mV and µV are supported."
+        )
+    return lookup[key.lower()]
+
+
+def load_wfdb(files: Any, signal_type: str | None, missing: str = "reject") -> Recording:
+    """Load a PhysioNet WFDB record (a .hea header plus its .dat signal file).
+
+    `files` is either the path to the .hea file (or the record name without extension),
+    or a list of uploaded files / (name, bytes) pairs that includes the .hea and .dat.
+    Header comments (which can hold age, sex or diagnoses) are never copied.
+    """
+    import wfdb
+
+    signal_type = _check_signal_type(signal_type)
+    missing = _check_missing_policy(missing)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        if isinstance(files, (str, Path)):
+            base = Path(files)
+            base = base.with_suffix("") if base.suffix.lower() == ".hea" else base
+            if not base.with_suffix(".hea").exists():
+                raise ValidationError(f"WFDB header not found: {base.name}.hea")
+            record_path = str(base)
+        else:
+            items = list(files)
+            if not items:
+                raise ValidationError("No WFDB files were provided. Upload the .hea and .dat files together.")
+            headers = []
+            total = 0
+            for item in items:
+                if isinstance(item, tuple):
+                    name, content = item
+                else:
+                    content, name = _read_bytes(item)
+                name = os.path.basename(str(name))
+                total += len(content)
+                if total > MAX_FILE_BYTES:
+                    raise ValidationError("Files are larger than 50 MB in total. Please use a shorter excerpt.")
+                with open(os.path.join(tmp, name), "wb") as fh:
+                    fh.write(content)
+                if name.lower().endswith(".hea"):
+                    headers.append(name)
+            if len(headers) != 1:
+                raise ValidationError("Upload exactly one WFDB header (.hea) file together with its .dat file.")
+            record_path = os.path.join(tmp, headers[0][:-4])
+        try:
+            record = wfdb.rdrecord(record_path, physical=True)
+        except FileNotFoundError as exc:
+            missing_name = os.path.basename(str(getattr(exc, "filename", "") or exc))
+            raise ValidationError(
+                f"A file named in the WFDB header is missing ({missing_name}). Upload the .hea and .dat files together."
+            ) from None
+        except Exception as exc:
+            raise ValidationError(f"Could not read this WFDB record: {exc}") from None
+
+    if record.p_signal is None or record.p_signal.size == 0:
+        raise ValidationError("The WFDB record contains no samples.")
+    names = [str(n) for n in record.sig_name]
+    scales = np.array([_wfdb_unit_scale(u, n) for u, n in zip(record.units, names)])
+    data = record.p_signal.T.astype(float) * scales[:, None]  # (n_channels, n_samples), volts
+    sfreq = float(record.fs)
+    rec = Recording(
+        signal_type=signal_type,
+        data=data,
+        sfreq=sfreq,
+        channel_names=names,
+        source="upload:wfdb",
+        data_kind="real",
+        meta={
+            "file_name": f"{record.record_name}.hea",
+            "original_unit": ", ".join(sorted(set(str(u) for u in record.units))),
+            "duration_s": data.shape[1] / sfreq,
+            "warnings": [],
+            "missing_policy": missing,
+        },
+    )
+    return validate(rec)
+
+
+def load_file(
+    file: Any,
+    signal_type: str | None,
+    sfreq: float | None = None,
+    unit: str | None = None,
+    missing: str = "reject",
+) -> Recording:
+    """Dispatch on file extension: .csv, .edf, or WFDB (.hea path or a list of .hea + .dat files)."""
+    if isinstance(file, (list, tuple)):
+        return load_wfdb(file, signal_type=signal_type, missing=missing)
     name = str(getattr(file, "name", file if isinstance(file, (str, Path)) else ""))
     lower = name.lower()
     if lower.endswith(".csv"):
-        return load_csv(file, sfreq=sfreq, unit=unit, signal_type=signal_type)
+        return load_csv(file, sfreq=sfreq, unit=unit, signal_type=signal_type, missing=missing)
     if lower.endswith(".edf"):
-        return load_edf(file, signal_type=signal_type)
-    raise ValidationError("Unsupported file type. Please upload a .csv or .edf file.")
+        return load_edf(file, signal_type=signal_type, missing=missing)
+    if lower.endswith(".hea") and isinstance(file, (str, Path)):
+        return load_wfdb(file, signal_type=signal_type, missing=missing)
+    raise ValidationError("Unsupported file type. Please upload a .csv or .edf file, or a WFDB .hea + .dat pair.")

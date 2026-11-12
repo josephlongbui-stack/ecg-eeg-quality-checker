@@ -10,9 +10,11 @@ import numpy as np
 
 from . import __version__
 from .config import BaseConfig, get_config
-from .detectors import REGISTRY
+from .beats import find_r_peaks
+from .detectors import MULTICHANNEL_REGISTRY, REGISTRY, electrode_motion, missing
+from .detectors.flatline import flat_mask
 from .io import ValidationError, validate
-from .merge import merge_and_suppress
+from .merge import merge_and_suppress, suppress_findings
 from .models import AnalysisResult, Recording
 from .preprocessing import iter_windows
 
@@ -57,14 +59,55 @@ def analyze_recording(
     raw_findings = []
     skipped: list[dict] = []
     notes: list[dict] = []
-    detector_meta = {"physical_range_V": recording.meta.get("physical_range_V", {})}
+    flag_missing = recording.meta.get("missing_policy") == "flag"
+    physical_range = recording.meta.get("physical_range_V", {})
+    needs_all_channels = bool(MULTICHANNEL_REGISTRY[recording.signal_type])
+    filled = np.empty(recording.data.shape) if needs_all_channels else None
+
     for i, channel in enumerate(recording.channel_names):
         x = np.array(recording.data[i], dtype=float, copy=True)
+        gap_mask = None
+        if flag_missing:
+            gap_mask = missing.missing_mask(x)
+            if gap_mask.any():
+                out = missing.detect(x, recording.sfreq, channel, cfg)
+                raw_findings.extend(out.findings)
+                x = missing.fill_missing(x)
+            if gap_mask.all():
+                skipped.append({"check": "all", "channel": channel, "reason": "channel contains no valid samples"})
+                if filled is not None:
+                    filled[i] = x
+                continue
+        channel_meta = {"physical_range_V": physical_range, "missing_mask": gap_mask}
+        r_peaks = None
+        if recording.signal_type == "ECG":
+            r_peaks = find_r_peaks(x, recording.sfreq)  # computed once, shared by the ECG checks
+            channel_meta["r_peaks"] = r_peaks
+        channel_findings = []
         for detect in REGISTRY[recording.signal_type]:
-            out = detect(x, recording.sfreq, channel, cfg, detector_meta)
+            out = detect(x, recording.sfreq, channel, cfg, channel_meta)
+            channel_findings.extend(out.findings)
+            skipped.extend(out.skipped)
+            notes.extend(out.notes)
+        if recording.signal_type == "ECG":
+            unusable = flat_mask(x, recording.sfreq, cfg)
+            if gap_mask is not None:
+                unusable = unusable | gap_mask
+            # use the evidence that survives suppression (e.g. a jump inside a dropout is not motion evidence)
+            evidence = suppress_findings(channel_findings)
+            out = electrode_motion.detect(x, recording.sfreq, channel, cfg, evidence, r_peaks, unusable)
+            channel_findings.extend(out.findings)
+        raw_findings.extend(channel_findings)
+        if filled is not None:
+            filled[i] = x
+
+    if filled is not None:
+        for detect in MULTICHANNEL_REGISTRY[recording.signal_type]:
+            out = detect(filled, recording.sfreq, recording.channel_names, cfg)
             raw_findings.extend(out.findings)
             skipped.extend(out.skipped)
             notes.extend(out.notes)
+        del filled
 
     if recording.duration_s < cfg.window_s:
         skipped.append(
@@ -74,8 +117,19 @@ def analyze_recording(
                 "reason": f"recording ({recording.duration_s:.1f} s) shorter than one {cfg.window_s:g} s window; analyzed as one window",
             }
         )
+    if recording.duration_s > cfg.large_warn_duration_min * 60 and recording.sfreq > cfg.large_warn_sfreq_hz:
+        notes.append(
+            {
+                "check": "large_recording",
+                "channel": "all",
+                "note": (
+                    f"Long recording ({recording.duration_s / 60:.0f} min at {recording.sfreq:g} Hz): analysis may be "
+                    "slow and memory-heavy on the free demo server. Consider analyzing a shorter excerpt."
+                ),
+            }
+        )
     if ml_model is not None:
-        skipped.append({"check": "ml_anomaly", "channel": "all", "reason": "ML layer is not part of Phase 1; rule-based results only"})
+        skipped.append({"check": "ml_anomaly", "channel": "all", "reason": "No trained model; rule-based results only"})
 
     findings = merge_and_suppress(raw_findings, cfg.merge_gap_s)
 

@@ -21,6 +21,9 @@ dependencies = [
     "pyyaml>=6.0,<7",
 ]
 
+[project.scripts]
+sqc = "signal_quality.cli:main"
+
 [project.optional-dependencies]
 app = ["streamlit>=1.67,<2"]
 dev = ["pytest>=9.2,<10"]
@@ -30,3 +33,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    # deprecation notices raised inside the wfdb library itself (not our code)
+    "ignore::DeprecationWarning:wfdb.*",
+    "ignore:The inplace keyword:Warning",
+]

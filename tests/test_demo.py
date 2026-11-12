@@ -16,7 +16,8 @@ def test_all_design_scenarios_exist():
         "ecg_spikes", "eeg_clean", "eeg_flat_channel", "eeg_powerline", "eeg_spikes", "eeg_drift",
         "eeg_clipping", "mixed_ecg",
     }
-    assert set(SCENARIO_IDS) == expected
+    phase2 = {"ecg_muscle_noise", "ecg_electrode_motion", "ecg_missing_data", "eeg_noisy_channel", "eeg_muscle", "eeg_ocular"}
+    assert set(SCENARIO_IDS) == expected | phase2
 
 
 @pytest.mark.parametrize("scenario_id", SCENARIO_IDS)
@@ -42,3 +43,9 @@ def test_scenarios_are_deterministic():
 def test_unknown_scenario():
     with pytest.raises(KeyError):
         make_scenario("does_not_exist")
+
+
+def test_every_scenario_is_labelled_simulated():
+    for sid in SCENARIO_IDS:
+        rec, _ = make_scenario(sid)
+        assert rec.meta["label"] == "Simulated signal — not a real recording"

@@ -55,15 +55,15 @@ Claude Code: build **one phase per session** unless told otherwise. Tick boxes (
 ---
 
 ## Phase 2 — Full detectors, formats, CLI (week 1–2)
-- [ ] WFDB loading (`load_wfdb`; multi-file upload of `.hea` + `.dat`)
-- [ ] Phase 2 detectors from DETECTORS.md: noisy channel, EEG muscle, ECG high-frequency noise, electrode motion, ocular, non-finite data
-- [ ] **Physiological plausibility hints** (ECG heart rate / RR timing; EEG amplitude) exactly per DETECTORS.md: always `uncertain`, non-diagnostic wording, tests showing clean simulated ECG at 60–100 bpm produces no hint
-- [ ] HTML report export (`reporting.to_html`) + config/version included
-- [ ] `cli.py` + `[project.scripts] sqc = "signal_quality.cli:main"`:
+- [x] WFDB loading (`load_wfdb`; multi-file upload of `.hea` + `.dat`)
+- [x] Phase 2 detectors from DETECTORS.md: noisy channel, EEG muscle, ECG high-frequency noise, electrode motion, ocular, non-finite data
+- [x] **Physiological plausibility hints** (ECG heart rate / RR timing; EEG amplitude) exactly per DETECTORS.md: always `uncertain`, non-diagnostic wording, tests showing clean simulated ECG at 60–100 bpm produces no hint
+- [x] HTML report export (`reporting.to_html`) + config/version included
+- [x] `cli.py` + `[project.scripts] sqc = "signal_quality.cli:main"`:
       `sqc analyze rec.edf --type EEG --out results/`; `sqc analyze rec.csv --type ECG --sfreq 360 --unit mV --out results/`; `sqc demo --list`
-- [ ] Test: CLI output == `analyze_recording()` output for the same input
-- [ ] Large-file handling: per-channel processing; warn above 30 min of data at high sfreq
-- [ ] **DoD:** all formats load; all detectors tested with fixtures; CLI documented in README with working examples; tests pass
+- [x] Test: CLI output == `analyze_recording()` output for the same input
+- [x] Large-file handling: per-channel processing; warn above 30 min of data at high sfreq
+- [x] **DoD:** all formats load; all detectors tested with fixtures; CLI documented in README with working examples; tests pass
 
 ## Phase 3 — Evaluation & notebooks (week 3)
 - [ ] `scripts/download_data.py` (NSTDB + a small EEGMMIDB subset, e.g. 5 subjects, baseline runs R01/R02) with `wfdb.dl_database` / MNE helpers

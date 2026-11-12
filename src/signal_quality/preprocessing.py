@@ -43,3 +43,19 @@ def lowpass(x: np.ndarray, sfreq: float, cutoff_hz: float, order: int = 2) -> np
     sos = signal.butter(order, cutoff_hz, btype="low", fs=sfreq, output="sos")
     padlen = int(min(len(x) - 1, round(sfreq / cutoff_hz)))
     return signal.sosfiltfilt(sos, x, padtype="even", padlen=padlen)
+
+
+def bandpass(x: np.ndarray, sfreq: float, lo_hz: float, hi_hz: float, order: int = 2) -> np.ndarray:
+    """Zero-phase Butterworth band-pass with mirror padding. Returns a new array."""
+    x = np.asarray(x, dtype=float)
+    sos = signal.butter(order, [lo_hz, hi_hz], btype="band", fs=sfreq, output="sos")
+    padlen = int(min(len(x) - 1, round(sfreq / lo_hz)))
+    return signal.sosfiltfilt(sos, x, padtype="even", padlen=padlen)
+
+
+def highpass(x: np.ndarray, sfreq: float, cutoff_hz: float, order: int = 2) -> np.ndarray:
+    """Zero-phase Butterworth high-pass with mirror padding. Returns a new array."""
+    x = np.asarray(x, dtype=float)
+    sos = signal.butter(order, cutoff_hz, btype="high", fs=sfreq, output="sos")
+    padlen = int(min(len(x) - 1, round(sfreq / cutoff_hz)))
+    return signal.sosfiltfilt(sos, x, padtype="even", padlen=padlen)
